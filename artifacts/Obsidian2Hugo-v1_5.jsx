@@ -1,0 +1,2435 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import {
+  Upload, Settings, Eye, ArrowDownToLine, FileText, AlertTriangle,
+  Info, ChevronLeft, ChevronRight, X, Trash2, Check, Globe, BookOpen,
+  User, Copy, FolderArchive, Zap, ExternalLink, Edit3, ArrowUpCircle,
+  FolderOpen, AlertCircle, FileImage
+} from "lucide-react";
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS & TEMPLATES
+// ═══════════════════════════════════════════════════════════════
+
+const HUGO_VERSION = "0.155.3";
+const STEPS = ["Upload", "Configure", "Preview", "Download"];
+const STEP_ICONS = [Upload, Settings, Eye, ArrowDownToLine];
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
+const IMAGE_EXT_SET = new Set(IMAGE_EXTENSIONS);
+const IMAGE_ACCEPT = IMAGE_EXTENSIONS.map((e) => `.${e}`).join(",");
+
+const generateHugoToml = (cfg) => `baseURL = "https://${cfg.githubUsername || "username"}.github.io/${cfg.repoName || "my-blog"}/"
+languageCode = "en-us"
+title = "${(cfg.blogName || "My Blog").replace(/"/g, '\\"')}"
+# theme is imported via [module] below, do not set theme here
+
+[pagination]
+  pagerSize = 10
+
+[params]
+  env = "production"
+  description = "${(cfg.description || "").replace(/"/g, '\\"')}"
+  author = "${(cfg.author || "").replace(/"/g, '\\"')}"
+  defaultTheme = "auto"
+  ShowReadingTime = true
+  ShowShareButtons = false
+  ShowPostNavLinks = true
+  ShowBreadCrumbs = true
+  ShowCodeCopyButtons = true
+  ShowToc = true
+  math = true
+  mathjax = true
+
+[params.homeInfoParams]
+  Title = "${(cfg.blogName || "My Blog").replace(/"/g, '\\"')}"
+  Content = "${(cfg.description || "Welcome to my blog").replace(/"/g, '\\"')}"
+
+[markup]
+  [markup.goldmark]
+    [markup.goldmark.renderer]
+      unsafe = true
+    [markup.goldmark.extensions]
+      [markup.goldmark.extensions.passthrough]
+        enable = true
+        [markup.goldmark.extensions.passthrough.delimiters]
+          block = [["$$", "$$"], ['\\[', '\\]']]
+          inline = [["$", "$"], ['\\(', '\\)']]
+
+[module]
+  [[module.imports]]
+    path = "github.com/adityatelange/hugo-PaperMod"
+`;
+
+const generateGoMod = (cfg) => `module github.com/${cfg.githubUsername || "username"}/${cfg.repoName || "my-blog"}
+
+go 1.23
+`;
+
+const GO_SUM = "";
+
+const generateWorkflowYaml = () => `name: Deploy Hugo site to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HUGO_VERSION: "${HUGO_VERSION}"
+    steps:
+      - name: Install Hugo CLI
+        run: |
+          wget -O ${'$'}{{ runner.temp }}/hugo.deb https://github.com/gohugoio/hugo/releases/download/v${'$'}{HUGO_VERSION}/hugo_extended_${'$'}{HUGO_VERSION}_linux-amd64.deb
+          sudo dpkg -i ${'$'}{{ runner.temp }}/hugo.deb
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Install Hugo Modules
+        run: hugo mod get
+
+      - name: Build with Hugo
+        env:
+          HUGO_CACHEDIR: ${'$'}{{ runner.temp }}/hugo_cache
+          HUGO_ENVIRONMENT: production
+        run: |
+          hugo --minify --baseURL "${'$'}{{ steps.pages.outputs.base_url }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${'$'}{{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+`;
+
+const IMAGES_README = `# Images Folder
+
+This folder contains images for your Hugo blog posts.
+
+Image references in your markdown files have been converted to Hugo-compatible paths:
+- Obsidian syntax \`![[my-image.png]]\` → \`![](/{repo-name}/images/my-image.png)\`
+- Standard markdown \`![alt](my-image.png)\` → \`![alt](/{repo-name}/images/my-image.png)\`
+
+Images uploaded alongside your markdown files are automatically placed here.
+If any referenced images were not uploaded, you can manually copy them from
+your Obsidian vault into this folder.
+
+Hugo serves files in \`static/images/\` at the \`/{repo-name}/images/\` URL path
+when deployed to GitHub Pages at \`https://{username}.github.io/{repo-name}/\`.
+`;
+
+// ═══════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+function slugify(text) {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^\w\u00C0-\u024F\u4e00-\u9fff-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function titleFromFilename(name) {
+  return name.replace(/\.md$/i, "").replace(/[-_]/g, " ").trim();
+}
+
+function textToBase64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function generateId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// ═══════════════════════════════════════════════════════════════
+// YAML FRONT MATTER PARSER / SERIALIZER
+// ═══════════════════════════════════════════════════════════════
+
+function parseYamlValue(str) {
+  const trimmed = str.trim();
+  if (trimmed === "" || trimmed === "~" || trimmed === "null") return null;
+  if (trimmed === "true" || trimmed === "yes") return true;
+  if (trimmed === "false" || trimmed === "no") return false;
+  if (/^-?(?:0|[1-9]\d*)(\.\d+)?$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+  // Remove surrounding quotes
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseFrontMatter(content) {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return { frontMatter: null, body: content };
+
+  const yamlStr = match[1];
+  const body = content.slice(match[0].length).replace(/^\r?\n/, "");
+  const result = {};
+  const lines = yamlStr.split(/\r?\n/);
+  let currentKey = null;
+
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+
+    // Array item: "  - value"
+    const arrMatch = line.match(/^\s+-\s+(.*)/);
+    if (arrMatch && currentKey) {
+      if (!Array.isArray(result[currentKey])) result[currentKey] = [];
+      result[currentKey].push(parseYamlValue(arrMatch[1]));
+      continue;
+    }
+
+    // Key-value: "key: value"
+    const kvMatch = line.match(/^([\w][\w.-]*)\s*:\s*(.*)/);
+    if (kvMatch) {
+      const key = kvMatch[1];
+      const rawVal = kvMatch[2].trim();
+
+      if (rawVal === "") {
+        currentKey = key;
+        result[key] = [];
+      } else if (rawVal.startsWith("[") && rawVal.endsWith("]")) {
+        const inner = rawVal.slice(1, -1);
+        result[key] = inner
+          ? inner.split(",").map((s) => parseYamlValue(s.trim()))
+          : [];
+        currentKey = key;
+      } else {
+        result[key] = parseYamlValue(rawVal);
+        currentKey = key;
+      }
+    }
+  }
+
+  return { frontMatter: result, body };
+}
+
+function yamlQuote(str) {
+  const s = String(str);
+  if (
+    /[:#\[\]{}&*!|>'"%@`,\n]/.test(s) ||
+    /^(true|false|yes|no|null|~)$/i.test(s) ||
+    /^\d+(\.\d+)?$/.test(s)
+  ) {
+    return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  return s;
+}
+
+function serializeFrontMatter(fm) {
+  const lines = [];
+  // Ensure a preferred key order
+  const order = ["title", "date", "draft", "tags", "math", "description"];
+  const keys = [
+    ...order.filter((k) => k in fm),
+    ...Object.keys(fm).filter((k) => !order.includes(k)),
+  ];
+
+  for (const key of keys) {
+    const value = fm[key];
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      if (value.length === 0) continue;
+      lines.push(`${key}:`);
+      for (const item of value) {
+        lines.push(`  - ${yamlQuote(item)}`);
+      }
+    } else if (typeof value === "boolean") {
+      lines.push(`${key}: ${value}`);
+    } else if (typeof value === "number") {
+      lines.push(`${key}: ${value}`);
+    } else {
+      lines.push(`${key}: ${yamlQuote(value)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TRANSFORMATION ENGINE
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Build a map from filename (without .md) to { slug, targetDir } for cross-reference resolution.
+ * Also detects duplicate filenames.
+ */
+function buildSlugMap(files) {
+  const map = new Map();
+  const duplicates = [];
+
+  for (const f of files) {
+    const baseName = f.name.replace(/\.md$/i, "");
+    if (map.has(baseName)) {
+      duplicates.push(baseName);
+    }
+    map.set(baseName, { slug: f.slug || slugify(baseName), targetDir: f.targetDir || "posts" });
+  }
+
+  return { slugMap: map, duplicates };
+}
+
+/**
+ * Extract all image references from markdown text.
+ * Detects both Obsidian embeds (![[img.ext]]) and standard markdown (![alt](img.ext)).
+ * Returns a Set of flattened filenames (subdirectory stripped).
+ */
+function extractImageReferences(text) {
+  const refs = new Set();
+  const extPattern = IMAGE_EXTENSIONS.join("|");
+
+  // Obsidian image embeds: ![[path/to/image.ext]] or ![[image.ext]]
+  const obsidianRegex = new RegExp(`!\\[\\[([^\\]]+\\.(?:${extPattern}))\\]\\]`, "gi");
+  let m;
+  while ((m = obsidianRegex.exec(text)) !== null) {
+    const imgPath = m[1];
+    // Flatten: take only the filename (strip subdirectories)
+    const fileName = imgPath.split("/").pop();
+    refs.add(fileName);
+  }
+
+  // Standard markdown images: ![alt](path/to/image.ext) — skip external URLs
+  const mdRegex = new RegExp(`!\\[([^\\]]*)\\]\\(([^)]+\\.(?:${extPattern}))\\)`, "gi");
+  while ((m = mdRegex.exec(text)) !== null) {
+    const imgPath = m[2];
+    // Skip external URLs and already-resolved paths (containing /images/)
+    if (/^https?:\/\//i.test(imgPath) || /\/images\//.test(imgPath)) continue;
+    const fileName = imgPath.split("/").pop();
+    refs.add(fileName);
+  }
+
+  return refs;
+}
+
+/**
+ * Detect image filename collisions from flattening subdirectories.
+ * E.g., both "a/photo.png" and "b/photo.png" flatten to "photo.png".
+ */
+function detectImageFlattenCollisions(text) {
+  const extPattern = IMAGE_EXTENSIONS.join("|");
+  const pathToFlat = new Map(); // flattened name → Set of original paths
+
+  const obsidianRegex = new RegExp(`!\\[\\[([^\\]]+\\.(?:${extPattern}))\\]\\]`, "gi");
+  let m;
+  while ((m = obsidianRegex.exec(text)) !== null) {
+    const imgPath = m[1];
+    const flat = imgPath.split("/").pop();
+    if (!pathToFlat.has(flat)) pathToFlat.set(flat, new Set());
+    pathToFlat.get(flat).add(imgPath);
+  }
+
+  const mdRegex = new RegExp(`!\\[([^\\]]*)\\]\\(([^)]+\\.(?:${extPattern}))\\)`, "gi");
+  while ((m = mdRegex.exec(text)) !== null) {
+    const imgPath = m[2];
+    if (/^https?:\/\//i.test(imgPath) || /\/images\//.test(imgPath)) continue;
+    const flat = imgPath.split("/").pop();
+    if (!pathToFlat.has(flat)) pathToFlat.set(flat, new Set());
+    pathToFlat.get(flat).add(imgPath);
+  }
+
+  const collisions = [];
+  for (const [flat, originals] of pathToFlat) {
+    if (originals.size > 1) {
+      collisions.push({ flatName: flat, originals: Array.from(originals) });
+    }
+  }
+  return collisions;
+}
+
+/**
+ * Build the image base path: /{repoName}/images or /images if no repoName.
+ */
+function imageBasePath(repoName) {
+  const repo = (repoName || "").trim();
+  return repo ? `/${repo}/images` : "/images";
+}
+
+/**
+ * Transform image embeds:
+ *   Obsidian:  ![[image.ext]]       → ![](/{repo}/images/image.ext)
+ *   Obsidian:  ![[sub/image.ext]]   → ![](/{repo}/images/image.ext)  (flattened)
+ *   Standard:  ![alt](image.ext)    → ![alt](/{repo}/images/image.ext)
+ *   Standard:  ![alt](sub/img.ext)  → ![alt](/{repo}/images/img.ext) (flattened)
+ *   External URLs and already-resolved /images/ or /{repo}/images/ paths are left untouched.
+ */
+function transformImageEmbeds(text, repoName) {
+  const extPattern = IMAGE_EXTENSIONS.join("|");
+  const base = imageBasePath(repoName);
+
+  // Obsidian image embeds: ![[path/image.ext]] → ![](/{repo}/images/image.ext)
+  let result = text.replace(
+    new RegExp(`!\\[\\[([^\\]]+\\.(?:${extPattern}))\\]\\]`, "gi"),
+    (_, imgPath) => {
+      const fileName = imgPath.split("/").pop();
+      return `![](${base}/${fileName})`;
+    }
+  );
+
+  // Standard markdown images: ![alt](path/image.ext) → ![alt](/{repo}/images/image.ext)
+  // Skip external URLs and already-resolved paths (containing /images/)
+  result = result.replace(
+    new RegExp(`(!\\[[^\\]]*\\])\\(([^)]+\\.(?:${extPattern}))\\)`, "gi"),
+    (match, altPart, imgPath) => {
+      if (/^https?:\/\//i.test(imgPath) || /\/images\//.test(imgPath)) return match;
+      const fileName = imgPath.split("/").pop();
+      return `${altPart}(${base}/${fileName})`;
+    }
+  );
+
+  return result;
+}
+
+/**
+ * Transform wikilinks: [[name]] → [name](/posts/slug/)
+ *                      [[name|display]] → [display](/posts/slug/)
+ * Image embeds must be processed BEFORE this function.
+ */
+function transformWikilinks(text, slugMap, repoName) {
+  const warnings = [];
+  const resolved = new Set();
+  const imgBase = imageBasePath(repoName);
+
+  const result = text.replace(/\[\[([^\]]+)\]\]/g, (match, inner) => {
+    // Skip if this looks like an image embed that wasn't caught
+    if (inner.match(/\.(png|jpg|jpeg|gif|webp|svg|bmp|tiff)$/i)) {
+      const fileName = inner.split("/").pop();
+      return `![](${imgBase}/${fileName})`;
+    }
+
+    let target, display;
+    if (inner.includes("|")) {
+      const parts = inner.split("|");
+      target = parts[0].trim();
+      display = parts[1].trim();
+    } else {
+      target = inner.trim();
+      display = inner.trim();
+    }
+
+    // Handle section links: "note#section" → use "note" for slug lookup
+    const targetBase = target.split("#")[0].trim();
+    const section = target.includes("#") ? "#" + target.split("#").slice(1).join("#") : "";
+
+    const entry = slugMap.get(targetBase);
+    if (entry) {
+      resolved.add(targetBase);
+      return `[${display}](/${entry.targetDir}/${entry.slug}/${section})`;
+    } else {
+      // Best-effort: generate slug from target name
+      const fallbackSlug = slugify(targetBase);
+      if (!resolved.has(targetBase)) {
+        warnings.push({
+          level: "warning",
+          message: `Wikilink target "${targetBase}" not found in uploaded files. Link generated as best-effort.`,
+        });
+      }
+      return `[${display}](/posts/${fallbackSlug}/${section})`;
+    }
+  });
+
+  return { text: result, warnings };
+}
+
+/**
+ * Extract inline #tags from body text.
+ * Tags are kept in place (not removed). Returns unique tag list.
+ */
+function extractInlineTags(text) {
+  const tags = new Set();
+  // Match #tag preceded by start-of-line or whitespace
+  // Tag must start with letter, underscore, or CJK char
+  const regex = /(^|[\s,;(])#([a-zA-Z_\u00C0-\u024F\u4e00-\u9fff][\w\u00C0-\u024F\u4e00-\u9fff/-]*)/gm;
+  let m;
+  while ((m = regex.exec(text)) !== null) {
+    const tag = m[2];
+    // Skip hex colors
+    if (/^[0-9a-fA-F]{3,8}$/.test(tag)) continue;
+    tags.add(tag);
+  }
+  return Array.from(tags);
+}
+
+/**
+ * Transform LaTeX:
+ * 1. Escape unescaped asterisks inside math regions
+ * 2. Optionally convert to alternative delimiters ($$$$, \\\\)
+ * 3. Isolate display math: ensure $$ delimiters are on their own lines with blank-line separation
+ * 4. Space inline math: ensure spaces inside ($ content $) and outside (detach from adjacent chars/punctuation)
+ * Returns transformed text, whether math was found, and any notices.
+ */
+function transformLatex(text, useAltDelimiters, useAltLineBreaks) {
+  const warnings = [];
+  let hasMath = false;
+
+  // Protect code blocks first (they should already be protected, but belt-and-suspenders)
+  const codeHolder = [];
+  let safe = text.replace(/```[\s\S]*?```|`[^`\n]+`/g, (m) => {
+    codeHolder.push(m);
+    return `%%LATEXCODE_${codeHolder.length - 1}%%`;
+  });
+
+  // Replace flalign/flalign* environments with align/align*
+  safe = safe.replace(/\\(begin|end)\{flalign(\*?)\}/g, "\\$1{align$2}");
+
+  // Process display math ($$...$$) first — greedy for multi-line
+  // Output isolated format: blank line, $$ on own line, content, $$ on own line, blank line
+  // The [ \t]* on both sides consumes horizontal whitespace adjacent to the $$...$$ block
+  // so surrounding text doesn't retain trailing/leading spaces after isolation.
+  const displayRegex = /[ \t]*\$\$([\s\S]*?)\$\$[ \t]*/g;
+  let foundDisplay = false;
+  safe = safe.replace(displayRegex, (match, inner) => {
+    hasMath = true;
+    foundDisplay = true;
+    let processed = inner;
+    // Escape unescaped asterisks: * → \* (but not already escaped \*)
+    // First protect \begin{...*} and \end{...*} environment markers
+    const envHolder = [];
+    processed = processed.replace(/\\(begin|end)\{([^}]*)\}/g, (m) => {
+      envHolder.push(m);
+      return `%%LATEXENV_${envHolder.length - 1}%%`;
+    });
+    processed = processed.replace(/(^|[^\\])\*/g, "$1\\*");
+    // Restore environment markers
+    processed = processed.replace(/%%LATEXENV_(\d+)%%/g, (_, i) => envHolder[parseInt(i)]);
+
+    // Convert \\ to \\\\ for line breaks if enabled
+    if (useAltLineBreaks) {
+      processed = processed.replace(/(^|[^\\])\\\\([^\\]|$)/g, "$1\\\\\\\\$2");
+    }
+
+    // Trim content — remove leading/trailing whitespace/newlines from math body
+    const trimmed = processed.trim();
+
+    // Remove empty lines inside display math to prevent Goldmark from
+    // breaking out of math mode and treating content as plain text
+    const mathLines = trimmed.split("\n").filter((l) => l.trim() !== "");
+
+    // Prevent lines starting with = from being parsed as setext H1 headings
+    // Merge lines starting with = onto the nearest previous non-empty line
+    const merged = new Set(); // indices of lines that were merged (to remove later)
+    for (let li = 0; li < mathLines.length; li++) {
+      if (/^\s*=/.test(mathLines[li])) {
+        let target = li - 1;
+        while (target >= 0 && merged.has(target)) target--;
+        if (target >= 0) {
+          mathLines[target] = mathLines[target].trimEnd() + " " + mathLines[li].trim();
+          merged.add(li);
+        } else {
+          // No previous line — fallback to leading space
+          mathLines[li] = " " + mathLines[li].trimStart();
+        }
+      }
+    }
+    const safeTrimmed = mathLines.filter((_, i) => !merged.has(i)).join("\n")
+      .replace(/^\n+|\n+$/g, "");
+
+    // Wrap with isolated delimiters on their own lines
+    const delim = useAltDelimiters ? "$$$$" : "$$";
+    return `\n\n${delim}\n${safeTrimmed}\n${delim}\n\n`;
+  });
+
+  // Collapse excessive blank lines from display math isolation (3+ newlines → 2)
+  safe = safe.replace(/\n{3,}/g, "\n\n");
+
+  // Process inline math ($...$) — single line only, non-greedy
+  // Match $ not preceded by another $ (captured), and followed by non-$ (lookahead, not consumed)
+  // Adds internal spacing: $content$ → $ content $
+  // Adds space before: char$ → char $ (via spaceBefore)
+  const inlineRegex = /(^|[^$])\$([^$\n]+?)\$(?=[^$]|$)/g;
+  safe = safe.replace(inlineRegex, (match, pre, inner) => {
+    // Skip if it looks like currency: $5, $10.00
+    if (/^\d/.test(inner.trim())) return match;
+    hasMath = true;
+    let processed = inner.trim();
+    processed = processed.replace(/(^|[^\\])\*/g, "$1\\*");
+    // Add space between pre character and opening $, if pre is not whitespace
+    const spaceBefore = (pre && pre !== "" && !/\s/.test(pre)) ? " " : "";
+    return `${pre}${spaceBefore}$ ${processed} $`;
+  });
+
+  // Post-process: add space after closing inline $ when followed by non-whitespace
+  // Pattern targets the specific "$ content $" shape produced above, so it won't match
+  // currency ($50), display math ($$), or code placeholders.
+  safe = safe.replace(/(\$ [^$\n]+? \$)([^\s\n])/g, "$1 $2");
+
+  if (hasMath && !useAltDelimiters && !useAltLineBreaks) {
+    warnings.push({
+      level: "notice",
+      message: 'LaTeX detected. Standard delimiters are used. If math does not render correctly, try enabling alternative $$$$ delimiters or \\\\\\\\ line breaks in Configure settings.',
+    });
+  }
+
+  if (hasMath && useAltDelimiters) {
+    warnings.push({
+      level: "info",
+      message: "Alternative delimiter mode: display math uses $$$$ delimiters.",
+    });
+  }
+
+  if (hasMath && useAltLineBreaks) {
+    warnings.push({
+      level: "info",
+      message: "Alternative line break mode: \\\\ in display math is converted to \\\\\\\\.",
+    });
+  }
+
+  // Restore code blocks
+  safe = safe.replace(/%%LATEXCODE_(\d+)%%/g, (_, i) => codeHolder[parseInt(i)]);
+
+  return { text: safe, hasMath, warnings };
+}
+
+/**
+ * Full single-file transformation pipeline.
+ */
+function transformFile(file, slugMap, config) {
+  const warnings = [];
+  let content = file.originalContent;
+
+  // 1. Parse existing front matter
+  const { frontMatter: existingFm, body } = parseFrontMatter(content);
+  let text = body;
+
+  // 2. Protect code blocks
+  const codeBlocks = [];
+  text = text.replace(/```[\s\S]*?```|`[^`\n]+`/g, (m) => {
+    codeBlocks.push(m);
+    return `%%CODEBLOCK_${codeBlocks.length - 1}%%`;
+  });
+
+  // 3. Transform image embeds (before wikilinks)
+  // Check for flatten collisions first
+  const flattenCollisions = detectImageFlattenCollisions(text);
+  for (const col of flattenCollisions) {
+    warnings.push({
+      level: "warning",
+      message: `Image filename collision: "${col.flatName}" maps to multiple paths: ${col.originals.join(", ")}. Only one will be used.`,
+    });
+  }
+  text = transformImageEmbeds(text, config.repoName);
+
+  // 4. Transform wikilinks
+  const wlResult = transformWikilinks(text, slugMap, config.repoName);
+  text = wlResult.text;
+  warnings.push(...wlResult.warnings);
+
+  // 5. Restore code blocks (before LaTeX to avoid double-protection)
+  text = text.replace(/%%CODEBLOCK_(\d+)%%/g, (_, i) => codeBlocks[parseInt(i)]);
+
+  // 6. Transform LaTeX
+  const latexResult = transformLatex(text, config.useAltDelimiters, config.useAltLineBreaks);
+  text = latexResult.text;
+  warnings.push(...latexResult.warnings);
+
+  // 7. Extract inline tags
+  const inlineTags = extractInlineTags(text);
+
+  // 8. Build merged front matter
+  const fm = { ...(existingFm || {}) };
+
+  // Title: preserve existing, fallback to first H1 or filename
+  if (!fm.title) {
+    const h1Match = text.match(/^#\s+(.+)$/m);
+    fm.title = h1Match ? h1Match[1].trim() : titleFromFilename(file.name);
+  }
+
+  // Date: preserve existing
+  if (!fm.date && !fm.created) {
+    fm.date = new Date().toISOString().split("T")[0];
+  }
+
+  // Draft: preserve existing, default false
+  if (fm.draft === undefined) {
+    fm.draft = false;
+  }
+
+  // Tags: merge inline + existing
+  const existingTags = Array.isArray(fm.tags) ? fm.tags.map(String) : [];
+  if (inlineTags.length > 0) {
+    const merged = [...new Set([...existingTags, ...inlineTags])];
+    if (existingTags.length > 0 && inlineTags.length > 0) {
+      const newTags = inlineTags.filter((t) => !existingTags.includes(t));
+      if (newTags.length > 0) {
+        warnings.push({
+          level: "info",
+          message: `Tags exist both in the article body and front matter. All tags have been merged (${newTags.length} new tag${newTags.length > 1 ? "s" : ""} added).`,
+        });
+      }
+    }
+    fm.tags = merged;
+  }
+
+  // Math flag
+  if (latexResult.hasMath) {
+    fm.math = true;
+  }
+
+  // 9. Assemble output
+  const fmStr = serializeFrontMatter(fm);
+  const transformed = `---\n${fmStr}\n---\n\n${text}`;
+
+  return { transformed, warnings, frontMatter: fm };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HUGO TOML PARSER (minimal, for existing site import)
+// ═══════════════════════════════════════════════════════════════
+
+function parseHugoToml(content) {
+  const result = {
+    baseURL: "",
+    title: "",
+    description: "",
+    author: "",
+    githubUsername: "",
+    repoName: "",
+    useAltDelimiters: false,
+    languageCode: "",
+  };
+
+  // Parse into sections: track current section path e.g. "params", "markup.goldmark.extensions.passthrough.delimiters"
+  let currentSection = "";
+  const lines = content.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+
+    // Detect section header: [section] or [[section]]
+    const sectionMatch = trimmed.match(/^\[{1,2}\s*([\w.]+)\s*\]{1,2}$/);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1].toLowerCase();
+      continue;
+    }
+
+    // Parse key = value
+    const kvMatch = trimmed.match(/^([\w]+)\s*=\s*(.*)/);
+    if (!kvMatch) continue;
+
+    const key = kvMatch[1].toLowerCase();
+    let rawVal = kvMatch[2].trim();
+
+    // Strip quotes
+    const unquote = (s) => {
+      if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+        return s.slice(1, -1);
+      }
+      return s;
+    };
+
+    const val = unquote(rawVal);
+
+    // Top-level keys
+    if (currentSection === "") {
+      if (key === "baseurl") result.baseURL = val;
+      if (key === "title") result.title = val;
+      if (key === "languagecode") result.languageCode = val;
+    }
+
+    // [params] section
+    if (currentSection === "params") {
+      if (key === "description") result.description = val;
+      if (key === "author") result.author = val;
+    }
+
+    // [params.homeInfoParams] — fallback for description
+    if (currentSection === "params.homeinfoparams") {
+      if (key === "content" && !result.description) result.description = val;
+    }
+
+    // [markup.goldmark.extensions.passthrough] — detect alt delimiters
+    if (currentSection === "markup.goldmark.extensions.passthrough.delimiters") {
+      if (key === "block") {
+        // Check if block delimiters include "$$$$"
+        if (rawVal.includes("$$$$")) {
+          result.useAltDelimiters = true;
+        }
+      }
+    }
+  }
+
+  // Extract githubUsername and repoName from baseURL
+  // Pattern: https://USERNAME.github.io/REPO-NAME/
+  const ghPagesMatch = result.baseURL.match(/https?:\/\/([^.]+)\.github\.io\/([^/]+)/);
+  if (ghPagesMatch) {
+    result.githubUsername = ghPagesMatch[1];
+    result.repoName = ghPagesMatch[2];
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ZIP OPERATIONS
+// ═══════════════════════════════════════════════════════════════
+
+async function generateSiteZip(files, config, JSZip, existingSite, preserveToml, imageFiles = []) {
+  const zip = new JSZip();
+  const rootName = `${slugify(config.blogName || "my-blog")}-hugo-site`;
+  const root = zip.folder(rootName);
+
+  // Build a set of new post paths for overwrite detection
+  const newPostPaths = new Set();
+  for (const f of files) {
+    if (f.transformedContent) {
+      const dir = f.targetDir || "posts";
+      newPostPaths.add(`content/${dir}/${f.slug || slugify(f.name.replace(/\.md$/i, ""))}.md`);
+    }
+  }
+
+  if (existingSite && existingSite.files) {
+    // Merge mode: include existing site files first
+    for (const [path, entry] of Object.entries(existingSite.files)) {
+      if (entry.dir) continue;
+      const willOverwrite = newPostPaths.has(path);
+      const isHugoToml = path === "hugo.toml";
+      const isGoMod = path === "go.mod" || path === "go.sum";
+      const isWorkflow = path === ".github/workflows/hugo.yml";
+
+      if (willOverwrite) continue;
+      if (isHugoToml && !preserveToml) continue;
+      if (isGoMod || isWorkflow) continue;
+
+      const content = await entry.async("uint8array");
+      root.file(path, content);
+    }
+  }
+
+  // Hugo config: preserved (already copied above) or generated
+  if (!existingSite || !preserveToml) {
+    root.file("hugo.toml", generateHugoToml(config));
+  }
+  root.file("go.mod", generateGoMod(config));
+  root.file("go.sum", GO_SUM);
+
+  // GitHub Actions
+  const ghFolder = root.folder(".github").folder("workflows");
+  ghFolder.file("hugo.yml", generateWorkflowYaml());
+
+  // Content: place each file in its target directory
+  for (const f of files) {
+    if (f.transformedContent) {
+      const dir = f.targetDir || "posts";
+      root.folder("content").folder(dir).file(
+        `${f.slug || slugify(f.name.replace(/\.md$/i, ""))}.md`,
+        f.transformedContent
+      );
+    }
+  }
+
+  // Static images folder: bundle uploaded images + README
+  const imagesFolder = root.folder("static").folder("images");
+  imagesFolder.file("README.md", IMAGES_README);
+  for (const img of imageFiles) {
+    imagesFolder.file(img.name, img.data);
+  }
+
+  return zip.generateAsync({ type: "base64" });
+}
+
+async function generatePostsZip(files, JSZip) {
+  const zip = new JSZip();
+  for (const f of files) {
+    if (f.transformedContent) {
+      zip.file(`${f.slug || slugify(f.name.replace(/\.md$/i, ""))}.md`, f.transformedContent);
+    }
+  }
+  return zip.generateAsync({ type: "base64" });
+}
+
+async function parseExistingSiteZip(arrayBuffer, JSZip) {
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const result = {
+    hugoTomlRaw: null,
+    parsedConfig: null,
+    goModRaw: null,
+    existingPosts: [],
+    contentDirs: [],
+    files: {},
+    rootPrefix: "",
+  };
+
+  const allPaths = Object.keys(zip.files).filter((p) => !zip.files[p].dir);
+
+  // Detect if zip has a single root folder wrapping everything
+  // If all files start with the same "folder/" prefix, strip it
+  let rootPrefix = "";
+  if (allPaths.length > 0) {
+    const firstSlash = allPaths[0].indexOf("/");
+    if (firstSlash > 0) {
+      const candidate = allPaths[0].slice(0, firstSlash + 1);
+      const allMatch = allPaths.every((p) => p.startsWith(candidate));
+      if (allMatch) {
+        rootPrefix = candidate;
+      }
+    }
+  }
+  result.rootPrefix = rootPrefix;
+
+  // Normalize path by stripping root prefix
+  const normalize = (p) => (rootPrefix && p.startsWith(rootPrefix) ? p.slice(rootPrefix.length) : p);
+
+  // Collect content directories (unique set)
+  const contentDirSet = new Set();
+
+  for (const [path, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const normalPath = normalize(path);
+
+    // Detect hugo.toml
+    if (normalPath === "hugo.toml") {
+      result.hugoTomlRaw = await entry.async("string");
+      result.parsedConfig = parseHugoToml(result.hugoTomlRaw);
+    }
+
+    // Detect go.mod
+    if (normalPath === "go.mod") {
+      result.goModRaw = await entry.async("string");
+    }
+
+    // Scan all content/ subdirectories for .md files (excluding _index.md)
+    if (normalPath.startsWith("content/") && normalPath.endsWith(".md")) {
+      const fileName = normalPath.split("/").pop();
+      if (fileName !== "_index.md") {
+        result.existingPosts.push(normalPath);
+      }
+      // Extract the directory path relative to content/
+      const relDir = normalPath.slice("content/".length);
+      const dirParts = relDir.split("/");
+      if (dirParts.length > 1) {
+        // Build all parent directory paths
+        for (let i = 1; i < dirParts.length; i++) {
+          contentDirSet.add(dirParts.slice(0, i).join("/"));
+        }
+      }
+    }
+
+    // Store with normalized path
+    result.files[normalPath] = entry;
+  }
+
+  // Fallback: extract githubUsername/repoName from go.mod if not found in hugo.toml
+  if (result.goModRaw && result.parsedConfig) {
+    if (!result.parsedConfig.githubUsername || !result.parsedConfig.repoName) {
+      const goModMatch = result.goModRaw.match(/module\s+github\.com\/([^/\s]+)\/([^/\s]+)/);
+      if (goModMatch) {
+        if (!result.parsedConfig.githubUsername) result.parsedConfig.githubUsername = goModMatch[1];
+        if (!result.parsedConfig.repoName) result.parsedConfig.repoName = goModMatch[2];
+      }
+    }
+  }
+
+  // Sort content dirs and always ensure "posts" is an option
+  result.contentDirs = Array.from(contentDirSet).sort();
+  if (!result.contentDirs.includes("posts")) {
+    result.contentDirs.unshift("posts");
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LINE-LEVEL DIFF
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Compute a simple line-level diff using longest common subsequence (LCS).
+ * Returns two arrays of line markers: one for the original, one for the transformed.
+ * Each marker is: "same", "removed" (left only), or "added" (right only).
+ */
+function computeLineDiff(originalText, transformedText) {
+  const origLines = (originalText || "").split("\n");
+  const transLines = (transformedText || "").split("\n");
+
+  const m = origLines.length;
+  const n = transLines.length;
+
+  // Skip diff for very large files (>2000 lines) to avoid UI lag
+  if (m * n > 4000000) {
+    return { origMarkers: new Array(m).fill("same"), transMarkers: new Array(n).fill("same") };
+  }
+
+  // Build full LCS table for backtracking
+  const dp = [];
+  for (let i = 0; i <= m; i++) {
+    dp[i] = new Array(n + 1).fill(0);
+  }
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (origLines[i - 1] === transLines[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to produce diff markers
+  let i = m, j = n;
+  const origResult = [];
+  const transResult = [];
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && origLines[i - 1] === transLines[j - 1]) {
+      origResult.unshift("same");
+      transResult.unshift("same");
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      transResult.unshift("added");
+      j--;
+    } else {
+      origResult.unshift("removed");
+      i--;
+    }
+  }
+
+  return { origMarkers: origResult, transMarkers: transResult };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INLINE UI COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+
+function Badge({ level, children }) {
+  const colors = {
+    error: "bg-red-500/20 text-red-300 border-red-500/30",
+    warning: "bg-amber-500/20 text-amber-300 border-amber-500/30",
+    info: "bg-blue-500/20 text-blue-300 border-blue-500/30",
+    notice: "bg-purple-500/20 text-purple-300 border-purple-500/30",
+    success: "bg-emerald-500/20 text-emerald-300 border-emerald-500/30",
+    pending: "bg-gray-500/20 text-gray-400 border-gray-500/30",
+  };
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded-full border ${colors[level] || colors.pending}`}>
+      {children}
+    </span>
+  );
+}
+
+function CodePreview({ content, label, lineNumbers = true, markers = null }) {
+  const lines = content ? content.split("\n") : [];
+
+  const getLineStyle = (idx) => {
+    if (!markers || !markers[idx]) return {};
+    if (markers[idx] === "removed") return { background: "rgba(239, 68, 68, 0.12)", borderLeft: "3px solid rgba(239, 68, 68, 0.5)" };
+    if (markers[idx] === "added") return { background: "rgba(74, 222, 128, 0.10)", borderLeft: "3px solid rgba(74, 222, 128, 0.45)" };
+    return {};
+  };
+
+  const getTextColor = (idx) => {
+    if (!markers || !markers[idx]) return "#c8c8e0";
+    if (markers[idx] === "removed") return "#f0a0a0";
+    if (markers[idx] === "added") return "#a0e0b0";
+    return "#c8c8e0";
+  };
+
+  return (
+    <div className="flex-1 min-w-0 flex flex-col rounded-lg overflow-hidden border border-gray-700/50">
+      <div className="px-4 py-2 text-xs font-semibold tracking-wide" style={{ background: "#1e1e2e", color: "#a0a0c0" }}>
+        {label}
+      </div>
+      <div className="overflow-auto flex-1 text-sm leading-relaxed" style={{ background: "#12121c", maxHeight: "520px" }}>
+        <pre className="p-0 m-0">
+          <code>
+            {lines.map((line, i) => (
+              <div key={i} className="flex hover:bg-white/5 transition-colors" style={getLineStyle(i)}>
+                {lineNumbers && (
+                  <span className="inline-block w-12 text-right pr-3 select-none flex-shrink-0" style={{ color: "#4a4a6a" }}>
+                    {i + 1}
+                  </span>
+                )}
+                <span className="flex-1 whitespace-pre-wrap break-all px-2" style={{ color: getTextColor(i) }}>
+                  {line || " "}
+                </span>
+              </div>
+            ))}
+          </code>
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN COMPONENT
+// ═══════════════════════════════════════════════════════════════
+
+export default function Obsidian2Hugo() {
+  // ─── State ─────────────────────────────────
+  const [step, setStep] = useState(0);
+  const [files, setFiles] = useState([]);
+  const [config, setConfig] = useState({
+    blogName: "My Blog",
+    description: "A blog powered by Hugo and PaperMod",
+    author: "",
+    githubUsername: "",
+    repoName: "my-blog",
+    useAltDelimiters: false,
+    useAltLineBreaks: false,
+  });
+  const [remember, setRemember] = useState(false);
+  const [existingSite, setExistingSite] = useState(null);
+  const [autoFilledConfig, setAutoFilledConfig] = useState(null); // snapshot of auto-filled values from existing site
+  const [dismissedWarnings, setDismissedWarnings] = useState(new Set()); // field keys whose warnings have been dismissed
+  const [topBannerDismissed, setTopBannerDismissed] = useState(false);
+  const [previewIndex, setPreviewIndex] = useState(0);
+  const [jsZipReady, setJsZipReady] = useState(false);
+  const [zipLoading, setZipLoading] = useState(false);
+  const [siteBase64, setSiteBase64] = useState(null);
+  const [postsBase64, setPostsBase64] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const [preserveToml, setPreserveToml] = useState(true);
+  const [imageFiles, setImageFiles] = useState([]); // { id, name, size, data: ArrayBuffer }
+
+  const mdInputRef = useRef(null);
+  const zipInputRef = useRef(null);
+
+  // ─── Load JSZip ────────────────────────────
+  useEffect(() => {
+    if (window.JSZip) { setJsZipReady(true); return; }
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    s.onload = () => setJsZipReady(true);
+    s.onerror = () => console.error("Failed to load JSZip");
+    document.head.appendChild(s);
+  }, []);
+
+  // ─── Load saved preferences ────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        const u = await window.storage.get("obsidian2hugo:githubUsername");
+        const r = await window.storage.get("obsidian2hugo:repoName");
+        if (u?.value || r?.value) {
+          setConfig((c) => ({
+            ...c,
+            githubUsername: u?.value || c.githubUsername,
+            repoName: r?.value || c.repoName,
+          }));
+          setRemember(true);
+        }
+      } catch (_) { /* storage not available */ }
+    })();
+  }, []);
+
+  // ─── File handling ─────────────────────────
+  const isImageFile = useCallback((name) => {
+    const ext = name.split(".").pop().toLowerCase();
+    return IMAGE_EXT_SET.has(ext);
+  }, []);
+
+  const handleFiles = useCallback((fileList) => {
+    const allFiles = Array.from(fileList);
+    const mdList = allFiles.filter((f) => f.name.endsWith(".md"));
+    const imgList = allFiles.filter((f) => isImageFile(f.name));
+
+    // Process markdown files
+    if (mdList.length > 0) {
+      const newFiles = mdList.map((f) => ({
+        id: generateId(),
+        name: f.name,
+        size: f.size,
+        slug: slugify(f.name.replace(/\.md$/i, "")),
+        targetDir: "posts",
+        originalContent: null,
+        transformedContent: null,
+        warnings: [],
+        status: "pending",
+        file: f,
+      }));
+
+      for (const nf of newFiles) {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          setFiles((prev) =>
+            prev.map((f) =>
+              f.id === nf.id ? { ...f, originalContent: ev.target.result, status: "ready" } : f
+            )
+          );
+        };
+        reader.onerror = () => {
+          setFiles((prev) =>
+            prev.map((f) => (f.id === nf.id ? { ...f, status: "error", warnings: [{ level: "error", message: "Failed to read file" }] } : f))
+          );
+        };
+        reader.readAsText(nf.file);
+      }
+
+      setFiles((prev) => {
+        const existingNames = new Set(prev.map((f) => f.name));
+        const unique = newFiles.filter((f) => !existingNames.has(f.name));
+        return [...prev, ...unique];
+      });
+    }
+
+    // Process image files
+    if (imgList.length > 0) {
+      for (const imgFile of imgList) {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          setImageFiles((prev) => {
+            // Deduplicate by name (flattened — only filename, no path)
+            if (prev.some((p) => p.name === imgFile.name)) return prev;
+            return [...prev, {
+              id: generateId(),
+              name: imgFile.name,
+              size: imgFile.size,
+              data: ev.target.result,
+            }];
+          });
+        };
+        reader.readAsArrayBuffer(imgFile);
+      }
+    }
+  }, [isImageFile]);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    handleFiles(e.dataTransfer.files);
+  }, [handleFiles]);
+
+  const handleZipUpload = useCallback(async (e) => {
+    const file = e.target.files[0];
+    if (!file || !jsZipReady) return;
+    setZipLoading(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const parsed = await parseExistingSiteZip(buf, window.JSZip);
+      setExistingSite(parsed);
+      if (parsed.parsedConfig) {
+        const pc = parsed.parsedConfig;
+        const filled = {};
+        const newConfig = {};
+
+        if (pc.title) { filled.blogName = pc.title; newConfig.blogName = pc.title; }
+        if (pc.description) { filled.description = pc.description; newConfig.description = pc.description; }
+        if (pc.author) { filled.author = pc.author; newConfig.author = pc.author; }
+        if (pc.githubUsername) { filled.githubUsername = pc.githubUsername; newConfig.githubUsername = pc.githubUsername; }
+        if (pc.repoName) { filled.repoName = pc.repoName; newConfig.repoName = pc.repoName; }
+        if (pc.useAltDelimiters) { filled.useAltDelimiters = true; newConfig.useAltDelimiters = true; }
+
+        if (Object.keys(newConfig).length > 0) {
+          setConfig((c) => ({ ...c, ...newConfig }));
+          setAutoFilledConfig(filled);
+          setDismissedWarnings(new Set());
+          setTopBannerDismissed(false);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to parse zip:", err);
+    }
+    setZipLoading(false);
+  }, [jsZipReady]);
+
+  const removeFile = useCallback((id) => {
+    setFiles((prev) => prev.filter((f) => f.id !== id));
+  }, []);
+
+  const removeImage = useCallback((id) => {
+    setImageFiles((prev) => prev.filter((f) => f.id !== id));
+  }, []);
+
+  // ─── Transform all files ──────────────────
+  const runTransform = useCallback(() => {
+    setFiles((prev) => {
+      const readyFiles = prev.filter((f) => f.originalContent);
+      const { slugMap, duplicates } = buildSlugMap(readyFiles);
+
+      return prev.map((f) => {
+        if (!f.originalContent) return { ...f, status: "error", warnings: [{ level: "error", message: "File content not loaded" }] };
+
+        try {
+          const { transformed, warnings, frontMatter } = transformFile(f, slugMap, config);
+
+          // Add duplicate warnings (for wikilink ambiguity)
+          const baseName = f.name.replace(/\.md$/i, "");
+          const allWarnings = [...warnings];
+          if (duplicates.includes(baseName)) {
+            allWarnings.push({ level: "warning", message: `Duplicate filename "${f.name}" detected. Wikilink resolution may be ambiguous.` });
+          }
+
+          return { ...f, transformedContent: transformed, warnings: allWarnings, status: "transformed", frontMatter };
+        } catch (err) {
+          return { ...f, status: "error", warnings: [{ level: "error", message: `Transformation failed: ${err.message}` }] };
+        }
+      });
+    });
+  }, [config]);
+
+  // ─── Generate downloads ───────────────────
+  const transformedFiles = useMemo(() => files.filter((f) => f.status === "transformed"), [files]);
+
+  const generateDownloads = useCallback(async () => {
+    if (!jsZipReady || transformedFiles.length === 0) return;
+    setZipLoading(true);
+    try {
+      // Only generate site zip when GitHub config or existing site is present
+      const hasGH = config.githubUsername.trim() !== "" && config.repoName.trim() !== "";
+      if (hasGH || existingSite) {
+        const sb64 = await generateSiteZip(transformedFiles, config, window.JSZip, existingSite, preserveToml, imageFiles);
+        setSiteBase64(sb64);
+      }
+      if (transformedFiles.length > 1) {
+        const pb64 = await generatePostsZip(transformedFiles, window.JSZip);
+        setPostsBase64(pb64);
+      }
+    } catch (err) {
+      console.error("Zip generation failed:", err);
+    }
+    setZipLoading(false);
+  }, [jsZipReady, transformedFiles, config, existingSite, preserveToml, imageFiles]);
+
+  // ─── Save preferences ─────────────────────
+  const savePreferences = useCallback(async () => {
+    try {
+      if (remember) {
+        await window.storage.set("obsidian2hugo:githubUsername", config.githubUsername);
+        await window.storage.set("obsidian2hugo:repoName", config.repoName);
+      } else {
+        try { await window.storage.delete("obsidian2hugo:githubUsername"); } catch (_) {}
+        try { await window.storage.delete("obsidian2hugo:repoName"); } catch (_) {}
+      }
+    } catch (_) {}
+  }, [remember, config.githubUsername, config.repoName]);
+
+  // ─── Slug update ──────────────────────────
+  const updateSlug = useCallback((id, newSlug) => {
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, slug: newSlug } : f)));
+  }, []);
+
+  // ─── Target directory update ──────────────
+  const updateTargetDir = useCallback((id, newDir) => {
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, targetDir: newDir } : f)));
+  }, []);
+
+  // ─── Copy to clipboard ────────────────────
+  const copyToClipboard = (text) => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  // ─── Auto-fill change detection ──────────
+  const isFieldAutoFilled = useCallback((fieldKey) => {
+    return autoFilledConfig && fieldKey in autoFilledConfig;
+  }, [autoFilledConfig]);
+
+  const isFieldChanged = useCallback((fieldKey) => {
+    if (!autoFilledConfig || !(fieldKey in autoFilledConfig)) return false;
+    return config[fieldKey] !== autoFilledConfig[fieldKey];
+  }, [autoFilledConfig, config]);
+
+  const isFieldWarningVisible = useCallback((fieldKey) => {
+    return isFieldChanged(fieldKey) && !dismissedWarnings.has(fieldKey);
+  }, [isFieldChanged, dismissedWarnings]);
+
+  const dismissFieldWarning = useCallback((fieldKey) => {
+    setDismissedWarnings((prev) => new Set([...prev, fieldKey]));
+  }, []);
+
+  const hasAnyAutoFill = !!autoFilledConfig && Object.keys(autoFilledConfig).length > 0;
+  const hasAnyVisibleChange = hasAnyAutoFill &&
+    Object.keys(autoFilledConfig).some((key) => isFieldChanged(key) && !dismissedWarnings.has(key));
+
+  // ─── Image reference tracking ─────────────
+  const imageRefSummary = useMemo(() => {
+    const allRefs = new Set();
+    for (const f of files) {
+      if (!f.originalContent) continue;
+      const refs = extractImageReferences(f.originalContent);
+      for (const r of refs) allRefs.add(r);
+    }
+    const uploadedNames = new Set(imageFiles.map((img) => img.name));
+    const missing = new Set();
+    const matched = new Set();
+    for (const ref of allRefs) {
+      if (uploadedNames.has(ref)) matched.add(ref);
+      else missing.add(ref);
+    }
+    const orphan = new Set();
+    for (const name of uploadedNames) {
+      if (!allRefs.has(name)) orphan.add(name);
+    }
+    return { allRefs, uploadedNames, missing, matched, orphan };
+  }, [files, imageFiles]);
+
+  // ─── Per-file image references (for preview warnings) ──
+  const perFileImageRefs = useMemo(() => {
+    const map = new Map();
+    for (const f of files) {
+      if (!f.originalContent) continue;
+      const refs = extractImageReferences(f.originalContent);
+      map.set(f.id, refs);
+    }
+    return map;
+  }, [files]);
+
+  // ─── Output path conflict detection ────────
+  const pathConflicts = useMemo(() => {
+    // Build map: output path → list of file ids
+    const pathMap = new Map();
+    for (const f of files) {
+      if (f.status !== "transformed") continue;
+      const dir = f.targetDir || "posts";
+      const slug = f.slug || slugify(f.name.replace(/\.md$/i, ""));
+      const outputPath = `content/${dir}/${slug}.md`;
+      if (!pathMap.has(outputPath)) pathMap.set(outputPath, []);
+      pathMap.get(outputPath).push(f.id);
+    }
+
+    // New ↔ New conflicts: paths with multiple files
+    const newNewConflicts = new Map(); // fileId → outputPath
+    for (const [path, ids] of pathMap) {
+      if (ids.length > 1) {
+        for (const id of ids) newNewConflicts.set(id, path);
+      }
+    }
+
+    // New ↔ Existing conflicts: path exists in uploaded repo
+    const newExistingConflicts = new Map(); // fileId → outputPath
+    if (existingSite) {
+      for (const [path, ids] of pathMap) {
+        if (existingSite.existingPosts.includes(path)) {
+          for (const id of ids) newExistingConflicts.set(id, path);
+        }
+      }
+    }
+
+    return { newNewConflicts, newExistingConflicts };
+  }, [files, existingSite]);
+
+  const hasPathConflicts = pathConflicts.newNewConflicts.size > 0 || pathConflicts.newExistingConflicts.size > 0;
+
+  // ─── Step navigation ──────────────────────
+  const canProceed = step === 0 ? files.length > 0 :
+                     step === 1 ? config.blogName.trim() !== "" :
+                     step === 2 ? !hasPathConflicts : false;
+
+  const goNext = async () => {
+    if (step === 1) {
+      await savePreferences();
+      runTransform();
+      setPreviewIndex(0);
+    }
+    if (step === 2) {
+      // Reset zip data — user will generate on demand from Download step
+      setSiteBase64(null);
+      setPostsBase64(null);
+    }
+    setStep((s) => Math.min(s + 1, 3));
+  };
+  const goBack = () => setStep((s) => Math.max(s - 1, 0));
+
+  // ─── Warning/info counts ──────────────────
+  const allWarnings = useMemo(() => files.flatMap((f) => f.warnings), [files]);
+  const warningCount = allWarnings.filter((w) => w.level === "warning" || w.level === "error").length;
+  const infoCount = allWarnings.filter((w) => w.level === "info" || w.level === "notice").length;
+
+  // ─── Derived values ───────────────────────
+  const hasGithubConfig = config.githubUsername.trim() !== "" && config.repoName.trim() !== "";
+  const canGenerateSite = hasGithubConfig || !!existingSite;
+  const blogUrl = `https://${config.githubUsername || "username"}.github.io/${config.repoName || "my-blog"}/`;
+  const gitCommands = `cd ${slugify(config.blogName || "my-blog")}-hugo-site
+git init
+git add .
+git commit -m "Initial Hugo site from Obsidian2Hugo"
+git branch -M main
+git remote add origin https://github.com/${config.githubUsername || "username"}/${config.repoName || "my-blog"}.git
+git push -u origin main`;
+
+  // ═════════════════════════════════════════════
+  // RENDER
+  // ═════════════════════════════════════════════
+
+  const containerStyle = {
+    background: "linear-gradient(160deg, #0c0c18 0%, #111125 50%, #0e0e1a 100%)",
+    color: "#e0e0f0",
+    fontFamily: "'Segoe UI', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif",
+    minHeight: "100vh",
+  };
+
+  const cardStyle = {
+    background: "rgba(20, 20, 40, 0.7)",
+    border: "1px solid rgba(120, 100, 200, 0.15)",
+    borderRadius: "12px",
+  };
+
+  return (
+    <div style={containerStyle} className="p-4 sm:p-6">
+      {/* ─── Header ─────────────────── */}
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #7c3aed, #4f46e5)" }}>
+            <Zap size={20} color="#fff" />
+          </div>
+          <div>
+            <h1 className="text-lg font-bold text-white tracking-tight">Obsidian2Hugo</h1>
+            <p className="text-xs" style={{ color: "#7a7a9a" }}>Zero-config blog publisher</p>
+          </div>
+        </div>
+        <span className="text-xs" style={{ color: "#5a5a7a" }}>v1.5 MVP</span>
+      </div>
+
+      {/* ─── Step Indicator ─────────── */}
+      <div className="flex items-center justify-center gap-2 mb-8">
+        {STEPS.map((name, i) => {
+          const Icon = STEP_ICONS[i];
+          const isActive = i === step;
+          const isDone = i < step;
+          return (
+            <div key={name} className="flex items-center gap-2">
+              <button
+                onClick={() => { if (isDone) setStep(i); }}
+                disabled={!isDone && !isActive}
+                className={`flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium transition-all ${
+                  isActive
+                    ? "text-white shadow-lg"
+                    : isDone
+                    ? "text-gray-300 hover:text-white cursor-pointer"
+                    : "text-gray-600 cursor-default"
+                }`}
+                style={isActive ? { background: "linear-gradient(135deg, #7c3aed, #6d28d9)" } : {}}
+              >
+                <Icon size={15} />
+                <span className="hidden sm:inline">{name}</span>
+              </button>
+              {i < STEPS.length - 1 && (
+                <div className="w-8 h-px" style={{ background: isDone ? "#7c3aed" : "#2a2a4a" }} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ─── Step Content ──────────── */}
+      <div className="max-w-4xl mx-auto">
+
+        {/* ═══ STEP 0: UPLOAD ═══ */}
+        {step === 0 && (
+          <div className="space-y-6">
+            {/* Drop Zone */}
+            <div
+              onDrop={handleDrop}
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+              onClick={() => mdInputRef.current?.click()}
+              className="cursor-pointer rounded-xl p-12 text-center transition-all hover:border-purple-500/50"
+              style={{ border: "2px dashed rgba(120, 100, 200, 0.3)", background: "rgba(20, 20, 40, 0.4)" }}
+            >
+              <ArrowUpCircle size={40} className="mx-auto mb-4" style={{ color: "#6a6a8a" }} />
+              <p className="text-lg text-gray-200">
+                Drop your Obsidian <span className="font-mono text-purple-400">.md</span> files and images here
+              </p>
+              <p className="text-sm mt-1" style={{ color: "#6a6a8a" }}>or click to browse — markdown and image files supported</p>
+              <input
+                ref={mdInputRef}
+                type="file"
+                accept={`.md,${IMAGE_ACCEPT}`}
+                multiple
+                onChange={(e) => handleFiles(e.target.files)}
+                className="hidden"
+              />
+            </div>
+
+            {/* Existing site upload */}
+            <div className="flex items-center gap-4">
+              <div className="flex-1 h-px" style={{ background: "#2a2a4a" }} />
+              <span className="text-xs tracking-widest" style={{ color: "#5a5a7a" }}>UPDATING AN EXISTING BLOG?</span>
+              <div className="flex-1 h-px" style={{ background: "#2a2a4a" }} />
+            </div>
+
+            <div className="text-center">
+              <button
+                onClick={() => zipInputRef.current?.click()}
+                disabled={!jsZipReady}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-all border"
+                style={{ borderColor: "rgba(120, 100, 200, 0.3)", color: "#c0c0e0", background: "rgba(20, 20, 40, 0.5)" }}
+              >
+                <FolderArchive size={16} />
+                Upload existing Hugo site (.zip)
+              </button>
+              <input
+                ref={zipInputRef}
+                type="file"
+                accept=".zip"
+                onChange={handleZipUpload}
+                className="hidden"
+              />
+              {existingSite && (
+                <div className="mt-3 text-sm text-emerald-400 flex items-center gap-2 justify-center">
+                  <Check size={14} />
+                  Site loaded{existingSite.parsedConfig?.title ? `: "${existingSite.parsedConfig.title}"` : ""} — {existingSite.existingPosts.length} existing post(s), {existingSite.contentDirs.length} content director{existingSite.contentDirs.length !== 1 ? "ies" : "y"}
+                </div>
+              )}
+              {zipLoading && <p className="mt-2 text-sm text-purple-400">Loading zip...</p>}
+            </div>
+
+            {/* File List */}
+            {(files.length > 0 || imageFiles.length > 0) && (
+              <div className="space-y-2">
+                {files.length > 0 && (
+                  <>
+                    <p className="text-sm" style={{ color: "#8a8aa0" }}>
+                      {files.length} markdown file{files.length > 1 ? "s" : ""} · {formatFileSize(files.reduce((s, f) => s + f.size, 0))}
+                    </p>
+                    {files.map((f) => (
+                      <div
+                        key={f.id}
+                        className="flex items-center gap-3 px-4 py-3 rounded-lg"
+                        style={cardStyle}
+                      >
+                        <FileText size={18} style={{ color: "#7a7a9a" }} />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-gray-200 truncate">{f.name}</p>
+                          <p className="text-xs" style={{ color: "#5a5a7a" }}>
+                            {formatFileSize(f.size)} · slug: {f.slug || "—"}
+                          </p>
+                        </div>
+                        <Badge level={f.status === "error" ? "error" : f.status === "ready" ? "success" : "pending"}>
+                          {f.status === "ready" ? "ready" : f.status}
+                        </Badge>
+                        <button onClick={() => removeFile(f.id)} className="text-gray-500 hover:text-red-400 transition-colors">
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    ))}
+                  </>
+                )}
+
+                {/* Image files */}
+                {imageFiles.length > 0 && (
+                  <>
+                    <p className="text-sm mt-3" style={{ color: "#8a8aa0" }}>
+                      {imageFiles.length} image{imageFiles.length > 1 ? "s" : ""} · {formatFileSize(imageFiles.reduce((s, f) => s + f.size, 0))}
+                    </p>
+                    {imageFiles.map((img) => (
+                      <div
+                        key={img.id}
+                        className="flex items-center gap-3 px-4 py-3 rounded-lg"
+                        style={cardStyle}
+                      >
+                        <FileImage size={18} style={{ color: "#7a9a7a" }} />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-gray-200 truncate">{img.name}</p>
+                          <p className="text-xs" style={{ color: "#5a5a7a" }}>
+                            {formatFileSize(img.size)} · static/images/{img.name}
+                          </p>
+                        </div>
+                        <Badge level="success">ready</Badge>
+                        <button onClick={() => removeImage(img.id)} className="text-gray-500 hover:text-red-400 transition-colors">
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    ))}
+                  </>
+                )}
+
+                {/* Image reference summary */}
+                {files.length > 0 && imageRefSummary.allRefs.size > 0 && (
+                  <div className="mt-3 px-4 py-3 rounded-lg text-xs space-y-1"
+                    style={{ background: "rgba(20, 20, 40, 0.5)", border: "1px solid rgba(120, 100, 200, 0.12)" }}>
+                    <p style={{ color: "#8a8aa0" }}>
+                      <FileImage size={12} className="inline mr-1.5" style={{ verticalAlign: "-2px" }} />
+                      {imageRefSummary.allRefs.size} image{imageRefSummary.allRefs.size !== 1 ? "s" : ""} referenced in markdown
+                    </p>
+                    {imageRefSummary.matched.size > 0 && (
+                      <p className="text-emerald-400">
+                        <Check size={11} className="inline mr-1" style={{ verticalAlign: "-1px" }} />
+                        {imageRefSummary.matched.size} matched with uploaded images
+                      </p>
+                    )}
+                    {imageRefSummary.missing.size > 0 && (
+                      <p className="text-amber-400">
+                        <AlertTriangle size={11} className="inline mr-1" style={{ verticalAlign: "-1px" }} />
+                        {imageRefSummary.missing.size} missing: {Array.from(imageRefSummary.missing).slice(0, 5).join(", ")}
+                        {imageRefSummary.missing.size > 5 ? ` (+${imageRefSummary.missing.size - 5} more)` : ""}
+                      </p>
+                    )}
+                    {imageRefSummary.orphan.size > 0 && (
+                      <p style={{ color: "#7a7a9a" }}>
+                        <Info size={11} className="inline mr-1" style={{ verticalAlign: "-1px" }} />
+                        {imageRefSummary.orphan.size} uploaded but not referenced: {Array.from(imageRefSummary.orphan).slice(0, 5).join(", ")}
+                        {imageRefSummary.orphan.size > 5 ? ` (+${imageRefSummary.orphan.size - 5} more)` : ""}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                <button
+                  onClick={() => { setFiles([]); setImageFiles([]); setExistingSite(null); setAutoFilledConfig(null); setDismissedWarnings(new Set()); setTopBannerDismissed(false); }}
+                  className="text-sm hover:text-red-400 transition-colors"
+                  style={{ color: "#6a6a8a" }}
+                >
+                  Clear all
+                </button>
+              </div>
+            )}
+
+            {/* Nav */}
+            <div className="flex justify-end pt-2">
+              <button
+                onClick={goNext}
+                disabled={!canProceed}
+                className="px-6 py-2.5 rounded-lg font-medium text-sm flex items-center gap-2 transition-all disabled:opacity-40"
+                style={{ background: canProceed ? "linear-gradient(135deg, #7c3aed, #6d28d9)" : "#2a2a4a", color: "#fff" }}
+              >
+                Continue to Configure <ChevronRight size={16} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 1: CONFIGURE ═══ */}
+        {step === 1 && (
+          <div className="space-y-6">
+            <div className="text-center mb-6">
+              <h2 className="text-xl font-bold text-white">Configure Your Blog</h2>
+              <p className="text-sm mt-1" style={{ color: "#7a7a9a" }}>
+                These settings generate your <span className="font-mono text-purple-400">hugo.toml</span> and GitHub Pages URL
+              </p>
+              {!hasGithubConfig && !existingSite && (
+                <div className="mt-3 mx-auto max-w-lg flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs"
+                  style={{ background: "rgba(245, 158, 11, 0.1)", border: "1px solid rgba(245, 158, 11, 0.2)", color: "#f0c060" }}>
+                  <Info size={14} className="flex-shrink-0" />
+                  <span>When GitHub username and repository name are empty, <span className="font-mono">hugo.toml</span>, <span className="font-mono">go.mod</span>, and site scaffolding will not be generated. You can still download transformed posts.</span>
+                </div>
+              )}
+            </div>
+
+            {/* Top banner: auto-filled notice */}
+            {hasAnyAutoFill && !topBannerDismissed && (
+              <div className="max-w-lg mx-auto flex items-center gap-3 px-4 py-3 rounded-lg text-xs"
+                style={{ background: "rgba(245, 158, 11, 0.08)", border: "1px solid rgba(245, 158, 11, 0.2)", color: "#f0c060" }}>
+                <AlertCircle size={16} className="flex-shrink-0" style={{ color: "#f0c060" }} />
+                <span className="flex-1">
+                  Fields below have been auto-filled from your existing Hugo site. Changes will override the original configuration.
+                </span>
+                <button
+                  onClick={() => setTopBannerDismissed(true)}
+                  className="flex-shrink-0 p-0.5 rounded hover:bg-white/10 transition-colors"
+                >
+                  <X size={14} style={{ color: "#f0c060" }} />
+                </button>
+              </div>
+            )}
+
+            {/* Top banner: field change notice */}
+            {hasAnyVisibleChange && topBannerDismissed && (
+              <div className="max-w-lg mx-auto flex items-center gap-3 px-4 py-3 rounded-lg text-xs"
+                style={{ background: "rgba(245, 158, 11, 0.08)", border: "1px solid rgba(245, 158, 11, 0.2)", color: "#f0c060" }}>
+                <AlertTriangle size={16} className="flex-shrink-0" style={{ color: "#f0c060" }} />
+                <span className="flex-1">
+                  You are changing existing blog information. Modified fields are highlighted below.
+                </span>
+              </div>
+            )}
+
+            <div className="space-y-5 max-w-lg mx-auto">
+              {/* Blog Name */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium mb-2 text-gray-300">
+                  <BookOpen size={14} className="text-purple-400" />
+                  Blog Name <span className="text-red-400">*</span>
+                  {isFieldAutoFilled("blogName") && !isFieldChanged("blogName") && (
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#6ee7b7", fontSize: "10px" }}>auto-filled</span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={config.blogName}
+                  onChange={(e) => setConfig((c) => ({ ...c, blogName: e.target.value }))}
+                  className="w-full px-4 py-2.5 rounded-lg text-sm text-white outline-none focus:ring-2 focus:ring-purple-500/50"
+                  style={{
+                    background: "rgba(20, 20, 40, 0.6)",
+                    border: isFieldWarningVisible("blogName") ? "1px solid rgba(245, 158, 11, 0.4)" : "1px solid rgba(120, 100, 200, 0.2)",
+                  }}
+                />
+                {isFieldWarningVisible("blogName") && (
+                  <div className="flex items-center gap-2 mt-1.5 text-xs" style={{ color: "#f0c060" }}>
+                    <AlertTriangle size={11} className="flex-shrink-0" />
+                    <span>Original: "{autoFilledConfig.blogName}"</span>
+                    <button onClick={() => dismissFieldWarning("blogName")} className="ml-auto p-0.5 rounded hover:bg-white/10"><X size={11} /></button>
+                  </div>
+                )}
+              </div>
+
+              {/* Description */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium mb-2 text-gray-300">
+                  <FileText size={14} className="text-purple-400" />
+                  Description
+                  {isFieldAutoFilled("description") && !isFieldChanged("description") && (
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#6ee7b7", fontSize: "10px" }}>auto-filled</span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={config.description}
+                  onChange={(e) => setConfig((c) => ({ ...c, description: e.target.value }))}
+                  className="w-full px-4 py-2.5 rounded-lg text-sm text-white outline-none focus:ring-2 focus:ring-purple-500/50"
+                  style={{
+                    background: "rgba(20, 20, 40, 0.6)",
+                    border: isFieldWarningVisible("description") ? "1px solid rgba(245, 158, 11, 0.4)" : "1px solid rgba(120, 100, 200, 0.2)",
+                  }}
+                />
+                {isFieldWarningVisible("description") && (
+                  <div className="flex items-center gap-2 mt-1.5 text-xs" style={{ color: "#f0c060" }}>
+                    <AlertTriangle size={11} className="flex-shrink-0" />
+                    <span>Original: "{autoFilledConfig.description}"</span>
+                    <button onClick={() => dismissFieldWarning("description")} className="ml-auto p-0.5 rounded hover:bg-white/10"><X size={11} /></button>
+                  </div>
+                )}
+              </div>
+
+              {/* Author */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium mb-2 text-gray-300">
+                  <User size={14} className="text-purple-400" />
+                  Author Name
+                  {isFieldAutoFilled("author") && !isFieldChanged("author") && (
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#6ee7b7", fontSize: "10px" }}>auto-filled</span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={config.author}
+                  onChange={(e) => setConfig((c) => ({ ...c, author: e.target.value }))}
+                  placeholder="Your Name"
+                  className="w-full px-4 py-2.5 rounded-lg text-sm text-white placeholder-gray-600 outline-none focus:ring-2 focus:ring-purple-500/50"
+                  style={{
+                    background: "rgba(20, 20, 40, 0.6)",
+                    border: isFieldWarningVisible("author") ? "1px solid rgba(245, 158, 11, 0.4)" : "1px solid rgba(120, 100, 200, 0.2)",
+                  }}
+                />
+                {isFieldWarningVisible("author") && (
+                  <div className="flex items-center gap-2 mt-1.5 text-xs" style={{ color: "#f0c060" }}>
+                    <AlertTriangle size={11} className="flex-shrink-0" />
+                    <span>Original: "{autoFilledConfig.author}"</span>
+                    <button onClick={() => dismissFieldWarning("author")} className="ml-auto p-0.5 rounded hover:bg-white/10"><X size={11} /></button>
+                  </div>
+                )}
+              </div>
+
+              {/* GitHub Username */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium mb-2 text-gray-300">
+                  <Globe size={14} className="text-purple-400" />
+                  GitHub Username
+                  {isFieldAutoFilled("githubUsername") && !isFieldChanged("githubUsername") && (
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#6ee7b7", fontSize: "10px" }}>auto-filled</span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={config.githubUsername}
+                  onChange={(e) => setConfig((c) => ({ ...c, githubUsername: e.target.value }))}
+                  placeholder="username"
+                  className="w-full px-4 py-2.5 rounded-lg text-sm text-white placeholder-gray-600 outline-none focus:ring-2 focus:ring-purple-500/50"
+                  style={{
+                    background: "rgba(20, 20, 40, 0.6)",
+                    border: isFieldWarningVisible("githubUsername") ? "1px solid rgba(245, 158, 11, 0.4)" : "1px solid rgba(120, 100, 200, 0.2)",
+                  }}
+                />
+                <p className="text-xs mt-1" style={{ color: "#5a5a7a" }}>Used to generate your blog URL</p>
+                {isFieldWarningVisible("githubUsername") && (
+                  <div className="flex items-center gap-2 mt-1 text-xs" style={{ color: "#f0c060" }}>
+                    <AlertTriangle size={11} className="flex-shrink-0" />
+                    <span>Original: "{autoFilledConfig.githubUsername}"</span>
+                    <button onClick={() => dismissFieldWarning("githubUsername")} className="ml-auto p-0.5 rounded hover:bg-white/10"><X size={11} /></button>
+                  </div>
+                )}
+              </div>
+
+              {/* Repo Name */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium mb-2 text-gray-300">
+                  <Globe size={14} className="text-purple-400" />
+                  Repository Name
+                  {isFieldAutoFilled("repoName") && !isFieldChanged("repoName") && (
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#6ee7b7", fontSize: "10px" }}>auto-filled</span>
+                  )}
+                </label>
+                <input
+                  type="text"
+                  value={config.repoName}
+                  onChange={(e) => setConfig((c) => ({ ...c, repoName: e.target.value }))}
+                  className="w-full px-4 py-2.5 rounded-lg text-sm text-white placeholder-gray-600 outline-none focus:ring-2 focus:ring-purple-500/50"
+                  style={{
+                    background: "rgba(20, 20, 40, 0.6)",
+                    border: isFieldWarningVisible("repoName") ? "1px solid rgba(245, 158, 11, 0.4)" : "1px solid rgba(120, 100, 200, 0.2)",
+                  }}
+                />
+                <p className="text-xs mt-1" style={{ color: "#5a5a7a" }}>The GitHub repo for your blog</p>
+                {isFieldWarningVisible("repoName") && (
+                  <div className="flex items-center gap-2 mt-1 text-xs" style={{ color: "#f0c060" }}>
+                    <AlertTriangle size={11} className="flex-shrink-0" />
+                    <span>Original: "{autoFilledConfig.repoName}"</span>
+                    <button onClick={() => dismissFieldWarning("repoName")} className="ml-auto p-0.5 rounded hover:bg-white/10"><X size={11} /></button>
+                  </div>
+                )}
+              </div>
+
+              {/* URL Preview */}
+              {config.githubUsername && (
+                <div className="px-4 py-3 rounded-lg" style={{ background: "rgba(120, 100, 200, 0.1)", border: "1px solid rgba(120, 100, 200, 0.15)" }}>
+                  <p className="text-xs mb-1" style={{ color: "#7a7a9a" }}>Your blog will be published at:</p>
+                  <p className="text-sm font-mono text-purple-400">{blogUrl}</p>
+                </div>
+              )}
+
+              {/* LaTeX alternative toggles */}
+              <div className="space-y-3 pt-2">
+                <p className="text-xs font-medium" style={{ color: "#7a7a9a" }}>LaTeX Options</p>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setConfig((c) => ({ ...c, useAltDelimiters: !c.useAltDelimiters }))}
+                    className={`w-10 h-5 rounded-full transition-all flex items-center ${
+                      config.useAltDelimiters ? "justify-end" : "justify-start"
+                    }`}
+                    style={{
+                      background: config.useAltDelimiters ? "#7c3aed" : "#2a2a4a",
+                      padding: "2px",
+                    }}
+                  >
+                    <div className="w-4 h-4 rounded-full bg-white transition-all" />
+                  </button>
+                  <span className="text-sm text-gray-300">Use <span className="font-mono text-purple-400">$$$$</span> for display math blocks</span>
+                  {isFieldAutoFilled("useAltDelimiters") && !isFieldChanged("useAltDelimiters") && (
+                    <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#6ee7b7", fontSize: "10px" }}>auto-filled</span>
+                  )}
+                </div>
+                {isFieldWarningVisible("useAltDelimiters") && (
+                  <div className="flex items-center gap-2 text-xs ml-13" style={{ color: "#f0c060" }}>
+                    <AlertTriangle size={11} className="flex-shrink-0" />
+                    <span>Original: {autoFilledConfig.useAltDelimiters ? "enabled" : "disabled"}</span>
+                    <button onClick={() => dismissFieldWarning("useAltDelimiters")} className="ml-auto p-0.5 rounded hover:bg-white/10"><X size={11} /></button>
+                  </div>
+                )}
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setConfig((c) => ({ ...c, useAltLineBreaks: !c.useAltLineBreaks }))}
+                    className={`w-10 h-5 rounded-full transition-all flex items-center ${
+                      config.useAltLineBreaks ? "justify-end" : "justify-start"
+                    }`}
+                    style={{
+                      background: config.useAltLineBreaks ? "#7c3aed" : "#2a2a4a",
+                      padding: "2px",
+                    }}
+                  >
+                    <div className="w-4 h-4 rounded-full bg-white transition-all" />
+                  </button>
+                  <span className="text-sm text-gray-300">Use <span className="font-mono text-purple-400">\\\\</span> for line breaks in math</span>
+                </div>
+              </div>
+
+              {/* Remember */}
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setRemember((r) => !r)}
+                  className={`w-5 h-5 rounded border flex items-center justify-center transition-all ${
+                    remember ? "bg-purple-600 border-purple-500" : "border-gray-600"
+                  }`}
+                >
+                  {remember && <Check size={12} color="#fff" />}
+                </button>
+                <span className="text-sm text-gray-400">Remember GitHub username & repo name</span>
+              </div>
+            </div>
+
+            {/* Nav */}
+            <div className="flex justify-between pt-4">
+              <button onClick={goBack} className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                <ChevronLeft size={16} /> Back
+              </button>
+              <button
+                onClick={goNext}
+                disabled={!canProceed}
+                className="px-6 py-2.5 rounded-lg font-medium text-sm flex items-center gap-2 transition-all disabled:opacity-40"
+                style={{ background: canProceed ? "linear-gradient(135deg, #7c3aed, #6d28d9)" : "#2a2a4a", color: "#fff" }}
+              >
+                Transform & Preview <ChevronRight size={16} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 2: PREVIEW ═══ */}
+        {step === 2 && (
+          <div className="space-y-4">
+            {/* Summary bar */}
+            <div className="flex items-center gap-4 flex-wrap">
+              <span className="flex items-center gap-1.5 text-sm text-emerald-400">
+                <Check size={14} />
+                {transformedFiles.length}/{files.length} transformed
+              </span>
+              {hasPathConflicts && (
+                <span className="flex items-center gap-1.5 text-sm text-red-400">
+                  <AlertCircle size={14} />
+                  {pathConflicts.newNewConflicts.size + pathConflicts.newExistingConflicts.size} conflict{(pathConflicts.newNewConflicts.size + pathConflicts.newExistingConflicts.size) > 1 ? "s" : ""}
+                </span>
+              )}
+              {warningCount > 0 && (
+                <span className="flex items-center gap-1.5 text-sm text-amber-400">
+                  <AlertTriangle size={14} />
+                  {warningCount} warning{warningCount > 1 ? "s" : ""}
+                </span>
+              )}
+              {imageFiles.length > 0 && (
+                <span className="flex items-center gap-1.5 text-sm" style={{ color: "#7a9a7a" }}>
+                  <FileImage size={14} />
+                  {imageFiles.length} image{imageFiles.length > 1 ? "s" : ""} bundled
+                </span>
+              )}
+              {infoCount > 0 && (
+                <span className="flex items-center gap-1.5 text-sm text-blue-400">
+                  <Info size={14} />
+                  {infoCount} notice{infoCount > 1 ? "s" : ""}
+                </span>
+              )}
+              <div className="flex-1" />
+              <div className="flex items-center gap-2 text-sm" style={{ color: "#7a7a9a" }}>
+                <button onClick={() => setPreviewIndex((i) => Math.max(0, i - 1))} disabled={previewIndex === 0} className="disabled:opacity-30">
+                  <ChevronLeft size={16} />
+                </button>
+                {previewIndex + 1} / {files.length}
+                <button onClick={() => setPreviewIndex((i) => Math.min(files.length - 1, i + 1))} disabled={previewIndex >= files.length - 1} className="disabled:opacity-30">
+                  <ChevronRight size={16} />
+                </button>
+              </div>
+            </div>
+
+            {/* File tabs */}
+            <div className="flex gap-2 overflow-x-auto pb-2">
+              {files.map((f, i) => {
+                const hasConflict = pathConflicts.newNewConflicts.has(f.id) || pathConflicts.newExistingConflicts.has(f.id);
+                return (
+                  <button
+                    key={f.id}
+                    onClick={() => setPreviewIndex(i)}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-all ${
+                      i === previewIndex ? "text-white" : "text-gray-500 hover:text-gray-300"
+                    }`}
+                    style={i === previewIndex
+                      ? { background: hasConflict ? "rgba(239, 68, 68, 0.2)" : "rgba(120, 100, 200, 0.25)", border: `1px solid ${hasConflict ? "rgba(239, 68, 68, 0.4)" : "rgba(120, 100, 200, 0.3)"}` }
+                      : { border: hasConflict ? "1px solid rgba(239, 68, 68, 0.25)" : "1px solid transparent" }}
+                  >
+                    <FileText size={12} />
+                    {f.name.replace(/\.md$/i, "")}
+                    {hasConflict && (
+                      <span className="w-2 h-2 rounded-full bg-red-500" />
+                    )}
+                    {!hasConflict && f.warnings.length > 0 && (
+                      <span className="w-2 h-2 rounded-full" style={{ background: f.warnings.some((w) => w.level === "error" || w.level === "warning") ? "#f59e0b" : "#3b82f6" }} />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Slug & target directory editor */}
+            {files[previewIndex] && (() => {
+              const curFile = files[previewIndex];
+              const nnConflict = pathConflicts.newNewConflicts.get(curFile.id);
+              const neConflict = pathConflicts.newExistingConflicts.get(curFile.id);
+              const hasConflict = !!nnConflict || !!neConflict;
+              return (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <Edit3 size={14} style={{ color: hasConflict ? "#f87171" : "#7a7a9a" }} />
+                    <span className="text-xs" style={{ color: "#7a7a9a" }}>Slug:</span>
+                    <input
+                      type="text"
+                      value={curFile.slug}
+                      onChange={(e) => updateSlug(curFile.id, e.target.value)}
+                      className="flex-1 max-w-xs px-3 py-1.5 rounded text-xs font-mono text-white outline-none focus:ring-1 focus:ring-purple-500/50"
+                      style={{
+                        background: "rgba(20, 20, 40, 0.6)",
+                        border: hasConflict ? "1px solid rgba(239, 68, 68, 0.5)" : "1px solid rgba(120, 100, 200, 0.2)",
+                      }}
+                    />
+                    {existingSite && existingSite.contentDirs.length > 0 && (
+                      <>
+                        <FolderOpen size={14} style={{ color: "#7a7a9a" }} />
+                        <span className="text-xs" style={{ color: "#7a7a9a" }}>Directory:</span>
+                        <select
+                          value={curFile.targetDir}
+                          onChange={(e) => updateTargetDir(curFile.id, e.target.value)}
+                          className="px-3 py-1.5 rounded text-xs font-mono text-white outline-none focus:ring-1 focus:ring-purple-500/50 cursor-pointer"
+                          style={{ background: "rgba(20, 20, 40, 0.6)", border: "1px solid rgba(120, 100, 200, 0.2)" }}
+                        >
+                          {existingSite.contentDirs.map((dir) => (
+                            <option key={dir} value={dir} style={{ background: "#1a1a2e" }}>
+                              content/{dir}/
+                            </option>
+                          ))}
+                        </select>
+                      </>
+                    )}
+                    {!existingSite && (
+                      <span className="text-xs font-mono" style={{ color: "#5a5a7a" }}>→ content/posts/</span>
+                    )}
+                  </div>
+                  {nnConflict && (
+                    <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                      style={{ background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.25)", color: "#f0a0a0" }}>
+                      <AlertCircle size={13} className="flex-shrink-0 text-red-400" />
+                      <span>Output path conflict: another uploaded file also outputs to <span className="font-mono">{nnConflict}</span>. Edit the slug or target directory to resolve.</span>
+                    </div>
+                  )}
+                  {neConflict && (
+                    <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                      style={{ background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.25)", color: "#f0a0a0" }}>
+                      <AlertCircle size={13} className="flex-shrink-0 text-red-400" />
+                      <span>Path <span className="font-mono">{neConflict}</span> already exists in the uploaded Hugo site. Edit the slug to avoid overwriting.</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Split pane */}
+            {files[previewIndex] && (() => {
+              const orig = files[previewIndex].originalContent || "";
+              const trans = files[previewIndex].transformedContent || files[previewIndex].originalContent || "";
+              const diff = files[previewIndex].transformedContent ? computeLineDiff(orig, trans) : null;
+              return (
+                <div className="flex gap-4" style={{ minHeight: "400px" }}>
+                  <CodePreview
+                    content={orig}
+                    label="Original — Obsidian Markdown"
+                    markers={diff?.origMarkers}
+                  />
+                  <CodePreview
+                    content={trans}
+                    label="Transformed — Hugo Markdown"
+                    markers={diff?.transMarkers}
+                  />
+                </div>
+              );
+            })()}
+
+            {/* Warnings for current file */}
+            {files[previewIndex] && (() => {
+              const curFile = files[previewIndex];
+              const fileImgRefs = perFileImageRefs.get(curFile.id) || new Set();
+              const uploadedNames = imageRefSummary.uploadedNames;
+              const missingImgs = Array.from(fileImgRefs).filter((r) => !uploadedNames.has(r));
+              const allMsgs = [...(curFile.warnings || [])];
+              // Add per-file missing image warnings
+              if (missingImgs.length > 0) {
+                allMsgs.push({
+                  level: "warning",
+                  message: `Missing image${missingImgs.length > 1 ? "s" : ""}: ${missingImgs.join(", ")}. Upload them or add manually to static/images/ after download.`,
+                });
+              }
+              return allMsgs.length > 0 ? (
+                <div className="space-y-2 mt-2">
+                  <p className="text-xs font-semibold flex items-center gap-1.5" style={{ color: "#9a9ab0" }}>
+                    <AlertTriangle size={13} />
+                    Messages for {curFile.name}
+                  </p>
+                  {allMsgs.map((w, i) => (
+                    <div
+                      key={i}
+                      className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs"
+                      style={{
+                        background: w.level === "error" ? "rgba(239,68,68,0.1)" :
+                                    w.level === "warning" ? "rgba(245,158,11,0.1)" :
+                                    w.level === "info" ? "rgba(59,130,246,0.1)" :
+                                    "rgba(139,92,246,0.1)",
+                        border: `1px solid ${
+                          w.level === "error" ? "rgba(239,68,68,0.2)" :
+                          w.level === "warning" ? "rgba(245,158,11,0.2)" :
+                          w.level === "info" ? "rgba(59,130,246,0.2)" :
+                          "rgba(139,92,246,0.2)"
+                        }`,
+                      }}
+                    >
+                      <Badge level={w.level}>{w.level}</Badge>
+                      <span style={{ color: "#c0c0d0" }}>{w.message}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null;
+            })()}
+
+            {/* Path conflict summary banner */}
+            {hasPathConflicts && (
+              <div className="flex items-center gap-3 px-4 py-3 rounded-lg text-xs"
+                style={{ background: "rgba(239, 68, 68, 0.08)", border: "1px solid rgba(239, 68, 68, 0.25)", color: "#f0a0a0" }}>
+                <AlertCircle size={16} className="flex-shrink-0 text-red-400" />
+                <span>
+                  {pathConflicts.newNewConflicts.size > 0 && `${new Set(pathConflicts.newNewConflicts.values()).size} duplicate output path${new Set(pathConflicts.newNewConflicts.values()).size > 1 ? "s" : ""} among uploaded files. `}
+                  {pathConflicts.newExistingConflicts.size > 0 && `${pathConflicts.newExistingConflicts.size} file${pathConflicts.newExistingConflicts.size > 1 ? "s" : ""} would overwrite existing posts. `}
+                  Resolve all conflicts by editing slugs or target directories before proceeding.
+                </span>
+              </div>
+            )}
+
+            {/* Nav */}
+            <div className="flex justify-between pt-4">
+              <button onClick={goBack} className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                <ChevronLeft size={16} /> Back
+              </button>
+              <button
+                onClick={goNext}
+                disabled={!canProceed}
+                className="px-6 py-2.5 rounded-lg font-medium text-sm flex items-center gap-2 transition-all disabled:opacity-40"
+                style={{ background: canProceed ? "linear-gradient(135deg, #7c3aed, #6d28d9)" : "#2a2a4a", color: "#fff" }}
+              >
+                Continue to Download <ChevronRight size={16} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 3: DOWNLOAD ═══ */}
+        {step === 3 && (
+          <div className="space-y-6">
+            <div className="text-center">
+              <h2 className="text-xl font-bold text-white">Your Hugo Site is Ready</h2>
+              <p className="text-sm mt-1" style={{ color: "#7a7a9a" }}>
+                {transformedFiles.length} post{transformedFiles.length !== 1 ? "s" : ""} transformed
+                {imageFiles.length > 0 && ` · ${imageFiles.length} image${imageFiles.length !== 1 ? "s" : ""} bundled`}
+              </p>
+            </div>
+
+            {/* Download buttons */}
+            <div className="grid grid-cols-2 gap-4">
+              {/* Complete site */}
+              <div
+                className={`rounded-xl p-6 text-center transition-all ${canGenerateSite ? "hover:scale-[1.02]" : "opacity-50"}`}
+                style={{ ...cardStyle, border: siteBase64 ? "1px solid rgba(120, 100, 200, 0.4)" : cardStyle.border }}
+              >
+                <FolderArchive size={32} className="mx-auto mb-3" style={{ color: canGenerateSite ? "#7c8cf0" : "#4a4a6a" }} />
+                <p className="font-semibold text-white text-sm mb-1">Download Complete Site</p>
+                <p className="text-xs mb-3" style={{ color: "#6a6a8a" }}>Hugo config + posts + images + GitHub Actions</p>
+
+                {!canGenerateSite ? (
+                  <p className="text-xs px-3" style={{ color: "#8a6a3a" }}>
+                    GitHub username and repository name are required to generate a complete site.
+                  </p>
+                ) : (
+                  <>
+                    {/* TOML preserve/replace toggle — only when existing site uploaded */}
+                    {existingSite && existingSite.hugoTomlRaw && (
+                      <div className="mb-4 mx-auto max-w-xs text-left">
+                        <p className="text-xs font-medium mb-2" style={{ color: "#7a7a9a" }}>hugo.toml handling:</p>
+                        <div className="space-y-1.5">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="tomlMode"
+                              checked={preserveToml}
+                              onChange={() => { setPreserveToml(true); setSiteBase64(null); }}
+                              className="accent-purple-500"
+                            />
+                            <span className="text-xs text-gray-300">Preserve original hugo.toml</span>
+                          </label>
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="tomlMode"
+                              checked={!preserveToml}
+                              onChange={() => { setPreserveToml(false); setSiteBase64(null); }}
+                              className="accent-purple-500"
+                            />
+                            <span className="text-xs text-gray-300">Replace with generated hugo.toml</span>
+                          </label>
+                        </div>
+                      </div>
+                    )}
+
+                    {siteBase64 ? (
+                      <a
+                        href={`data:application/zip;base64,${siteBase64}`}
+                        download={`${slugify(config.blogName || "my-blog")}-hugo-site.zip`}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white"
+                        style={{ background: "linear-gradient(135deg, #7c3aed, #6d28d9)" }}
+                      >
+                        <ArrowDownToLine size={14} /> Download .zip
+                      </a>
+                    ) : (
+                      <button
+                        onClick={generateDownloads}
+                        disabled={zipLoading}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-50"
+                        style={{ background: "linear-gradient(135deg, #7c3aed, #6d28d9)" }}
+                      >
+                        {zipLoading ? "Generating..." : "Generate .zip"}
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Posts only */}
+              <div className="rounded-xl p-6 text-center transition-all hover:scale-[1.02]" style={cardStyle}>
+                <FileText size={32} className="mx-auto mb-3" style={{ color: "#7c8cf0" }} />
+                <p className="font-semibold text-white text-sm mb-1">Download Posts Only</p>
+                <p className="text-xs mb-4" style={{ color: "#6a6a8a" }}>Transformed .md file{transformedFiles.length > 1 ? "s" : ""} for existing sites</p>
+                {transformedFiles.length === 1 && transformedFiles[0].transformedContent ? (
+                  <a
+                    href={`data:text/markdown;base64,${textToBase64(transformedFiles[0].transformedContent)}`}
+                    download={`${transformedFiles[0].slug || "post"}.md`}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white"
+                    style={{ background: "rgba(120, 100, 200, 0.3)", border: "1px solid rgba(120, 100, 200, 0.3)" }}
+                  >
+                    <ArrowDownToLine size={14} /> Download .md
+                  </a>
+                ) : postsBase64 ? (
+                  <a
+                    href={`data:application/zip;base64,${postsBase64}`}
+                    download="transformed-posts.zip"
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white"
+                    style={{ background: "rgba(120, 100, 200, 0.3)", border: "1px solid rgba(120, 100, 200, 0.3)" }}
+                  >
+                    <ArrowDownToLine size={14} /> Download .zip
+                  </a>
+                ) : transformedFiles.length > 1 ? (
+                  <button
+                    onClick={generateDownloads}
+                    disabled={zipLoading}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-50"
+                    style={{ background: "rgba(120, 100, 200, 0.3)", border: "1px solid rgba(120, 100, 200, 0.3)" }}
+                  >
+                    {zipLoading ? "Generating..." : "Generate .zip"}
+                  </button>
+                ) : (
+                  <p className="text-xs text-gray-500">No posts available</p>
+                )}
+              </div>
+            </div>
+
+            {/* Deploy Instructions — only shown when site generation is possible */}
+            {canGenerateSite && (
+            <div className="rounded-xl overflow-hidden" style={cardStyle}>
+              <div className="px-5 py-3 font-semibold text-sm text-white" style={{ background: "rgba(30, 30, 55, 0.8)" }}>
+                Deploy to GitHub Pages
+              </div>
+              <div className="p-5 space-y-6">
+                {/* Step 1 */}
+                <div className="flex gap-4">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold" style={{ background: "rgba(120, 100, 200, 0.2)", color: "#a78bfa" }}>1</div>
+                  <div>
+                    <p className="font-medium text-white text-sm">Create a new GitHub repository</p>
+                    <p className="text-xs mt-0.5" style={{ color: "#7a7a9a" }}>
+                      Create a new repo named "{config.repoName || "my-blog"}" at{" "}
+                      <span className="text-purple-400">github.com/new</span>
+                    </p>
+                  </div>
+                </div>
+
+                {/* Step 2 */}
+                <div className="flex gap-4">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold" style={{ background: "rgba(120, 100, 200, 0.2)", color: "#a78bfa" }}>2</div>
+                  <div className="flex-1">
+                    <p className="font-medium text-white text-sm">Extract and push the zip</p>
+                    <p className="text-xs mt-0.5 mb-3" style={{ color: "#7a7a9a" }}>Unzip the downloaded file and push to your new repo:</p>
+                    <div className="relative rounded-lg overflow-hidden" style={{ background: "#0c0c18" }}>
+                      <pre className="p-4 text-xs leading-relaxed overflow-x-auto" style={{ color: "#b0b0d0" }}>
+                        <code>{gitCommands}</code>
+                      </pre>
+                      <button
+                        onClick={() => copyToClipboard(gitCommands)}
+                        className="absolute top-2 right-2 p-1.5 rounded transition-colors"
+                        style={{ background: "rgba(120, 100, 200, 0.2)" }}
+                        title="Copy commands"
+                      >
+                        {copied ? <Check size={12} color="#10b981" /> : <Copy size={12} color="#7a7a9a" />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Step 3 */}
+                <div className="flex gap-4">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold" style={{ background: "rgba(120, 100, 200, 0.2)", color: "#a78bfa" }}>3</div>
+                  <div>
+                    <p className="font-medium text-white text-sm">Enable GitHub Pages</p>
+                    <p className="text-xs mt-0.5" style={{ color: "#7a7a9a" }}>
+                      In your repo, go to Settings → under "Code and automation", click Pages → under "Build and deployment", change the source to "GitHub Actions". The included workflow will handle the rest automatically.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Step 4 */}
+                <div className="flex gap-4">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold" style={{ background: "rgba(120, 100, 200, 0.2)", color: "#a78bfa" }}>4</div>
+                  <div>
+                    <p className="font-medium text-white text-sm">Visit your blog</p>
+                    <p className="text-xs mt-0.5" style={{ color: "#7a7a9a" }}>
+                      After the first workflow run completes (~2 minutes), visit:
+                    </p>
+                    <p className="text-sm font-mono mt-1 text-purple-400 flex items-center gap-1.5">
+                      {blogUrl} <ExternalLink size={12} />
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            )}
+
+            {/* Nav */}
+            <div className="flex justify-start pt-2">
+              <button onClick={goBack} className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                <ChevronLeft size={16} /> Back to Preview
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
